@@ -1,294 +1,308 @@
+import os
+import asyncio
 import logging
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup
-from telegram.ext import (
-    Application, CommandHandler, MessageHandler, CallbackQueryHandler,
-    ConversationHandler, filters, ContextTypes
-)
-import sqlite3
-import google.generativeai as genai
+from aiogram import Bot, Dispatcher, types, Router
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, WebAppInfo, LabeledPrice, ContentType
+from aiogram.filters import Command
+from aiogram import F
+from aiogram.enums import ParseMode
+from langchain_openai import ChatOpenAI
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain.memory import ConversationBufferMemory
+from langchain.agents import AgentExecutor, create_tool_calling_agent
+from langchain.tools import tool
+import openai
+import redis
+import supabase
+from pinecone import Pinecone
+from google.cloud import speech_v1p1beta1 as speech
+from google.cloud import texttospeech
+import elevenlabs
+from datetime import datetime, timedelta
+import uuid
+import json
+import requests
+from cryptography.fernet import Fernet
+from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
+from google.oauth2 import service_account
+import matplotlib.pyplot as plt
+import io
+import base64
 
-logging.basicConfig(level=logging.INFO)
+# Env vars
+BOT_TOKEN = os.getenv('BOT_TOKEN')
+OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')  # xAI/Grok fallback to OpenAI
+SUPABASE_URL = os.getenv('SUPABASE_URL')
+SUPABASE_KEY = os.getenv('SUPABASE_KEY')
+REDIS_HOST = os.getenv('REDIS_HOST', 'localhost')
+REDIS_PORT = int(os.getenv('REDIS_PORT', 6379))
+GOOGLE_CREDENTIALS = os.getenv('GOOGLE_CREDENTIALS')  # JSON
+ELEVENLABS_API_KEY = os.getenv('ELEVENLABS_API_KEY')
+OWNER_ID = int(os.getenv('OWNER_ID'))
+PRODUCT_DB = 'products.json'  # Replace with Airtable
+RAG_INDEX = 'rag-index'
+ENCRYPT_KEY = Fernet.generate_key() if not os.getenv('ENCRYPT_KEY') else Fernet(os.getenv('ENCRYPT_KEY'))
+DRIVE_CREDENTIALS = service_account.Credentials.from_service_account_file(GOOGLE_CREDENTIALS, scopes=['https://www.googleapis.com/auth/drive.readonly'])
+DRIVE_SERVICE = build('drive', 'v3', credentials=DRIVE_CREDENTIALS)
+
+# Setup
+logging.basicConfig(level=logging.INFO, filename='bot.log')
 logger = logging.getLogger(__name__)
 
-TOKEN = '8396553639:AAEvYPcODVlXxWVSaSwPnkvnXMGzBgjpjFA'  # ← твой свежий токен вставлен
+bot = Bot(token=BOT_TOKEN)
+dp = Dispatcher()
+router = Router()
+dp.include_router(router)
 
-GEMINI_API_KEY = 'AIzaSyBqBxOxFe7p2ZzOmNy7MSJaJk4-nB2eyBA'
+openai.api_key = OPENAI_API_KEY
+redis_client = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, db=0)
+supabase_client = supabase.create_client(SUPABASE_URL, SUPABASE_KEY)
+pinecone_client = Pinecone(api_key=os.getenv('PINECONE_API_KEY'))
+os.environ['GOOGLE_APPLICATION_CREDENTIALS'] = GOOGLE_CREDENTIALS
+speech_client = speech.SpeechClient()
+tts_client = texttospeech.TextToSpeechClient()
+elevenlabs.set_api_key(ELEVENLABS_API_KEY)
 
-genai.configure(api_key=GEMINI_API_KEY)
-GEMINI_MODEL = genai.GenerativeModel('gemini-1.5-flash')
-
-# Состояния
-(
-    MAIN, NEURO, CHEATS, PROFILE,
-    TEST_NEURO, SUPPORT_NEURO,
-    SUPPORT_CHEATS,
-    REGISTER_EMAIL, REGISTER_NAME,
-    LOGIN_EMAIL, LOGIN_NAME
-) = range(11)
-
-def db_init():
-    with sqlite3.connect('kodex_users.db') as conn:
-        conn.execute('''CREATE TABLE IF NOT EXISTS users (
-            email TEXT PRIMARY KEY,
-            name TEXT NOT NULL
-        )''')
-
-db_init()
-
-def back_button(to_section: str):
-    return InlineKeyboardButton("« Назад в тень", callback_data=f"back:{to_section}")
-
-def main_keyboard():
-    return ReplyKeyboardMarkup(
-        [["Нейросеть", "Читы на Роблокс"], ["Профиль"]],
-        resize_keyboard=True, one_time_keyboard=False
-    )
-
-MENUS = {
-    "main": {
-        "text": "Йо, это **Кодекс** 🔥\nАврора на связи — твоя безбашенная тень. Что сегодня разнесём?",
-        "keyboard": main_keyboard(),
-        "type": "reply"
-    },
-    "neuro": {
-        "text": "Нейросеть? Ооо, давай жечь мозги 🔥\nВыбирай, босс:",
-        "type": "inline",
-        "buttons": [
-            [InlineKeyboardButton("Купить нейросеть", callback_data="neuro:buy")],
-            [InlineKeyboardButton("Протестировать бесплатно (я в деле)", callback_data="neuro:test")],
-            [InlineKeyboardButton("Поддержка — пиши, не стесняйся", callback_data="neuro:support")],
-            [back_button("main")]
-        ]
-    },
-    "buy_neuro": {
-        "text": "Хочешь купить мощь? Выбирай:",
-        "type": "inline",
-        "buttons": [
-            [InlineKeyboardButton("Леша бот", callback_data="neuro:buy:lesha")],
-            [InlineKeyboardButton("Аврора (я сама, но пока сплю)", callback_data="neuro:buy:avrora")],
-            [back_button("neuro")]
-        ]
-    },
-    "cheats": {
-        "text": "Читы на Роблокс? Ха, давай ломать систему 😈",
-        "type": "inline",
-        "buttons": [
-            [InlineKeyboardButton("Codex", callback_data="cheats:codex")],
-            [InlineKeyboardButton("Delta Alex", callback_data="cheats:delta")],
-            [InlineKeyboardButton("Поддержка по читам", callback_data="cheats:support")],
-            [back_button("main")]
-        ]
-    },
-    "profile": {
-        "text": "Профиль? Заходим в тень, босс 💀",
-        "type": "inline",
-        "buttons": [
-            [InlineKeyboardButton("Зарегистрироваться", callback_data="profile:register")],
-            [InlineKeyboardButton("Войти", callback_data="profile:login")],
-            [back_button("main")]
-        ]
-    }
-}
-
-async def show_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, menu_key: str):
-    menu = MENUS[menu_key]
-    text = menu["text"]
-    
-    if menu["type"] == "reply":
-        await update.effective_message.reply_text(text, reply_markup=menu["keyboard"])
-    else:
-        keyboard = InlineKeyboardMarkup(menu["buttons"])
-        if update.callback_query:
-            await update.callback_query.message.edit_text(text, reply_markup=keyboard)
-            await update.callback_query.answer()
-        else:
-            await update.effective_message.reply_text(text, reply_markup=keyboard)
-
-async def go_neuro(update: Update, context):
-    await show_menu(update, context, "neuro")
-    return NEURO
-
-async def go_cheats(update: Update, context):
-    await show_menu(update, context, "cheats")
-    return CHEATS
-
-async def go_profile(update: Update, context):
-    await show_menu(update, context, "profile")
-    return PROFILE
-
-async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    data = query.data
-    parts = data.split(":")
-    action = parts[0] if len(parts) > 0 else ""
-    sub = parts[1] if len(parts) > 1 else ""
-    payload = parts[2] if len(parts) > 2 else ""
-
-    if action == "back":
-        target = sub if sub else "main"
-        if target == "main":
-            await query.message.delete()
-            await update.effective_message.reply_text("Возвращаемся в логово 🔥", reply_markup=main_keyboard())
-            return MAIN
-        else:
-            await show_menu(update, context, target)
-            return {"neuro": NEURO, "cheats": CHEATS, "profile": PROFILE}.get(target, MAIN)
-
-    elif action == "neuro":
-        if sub == "buy":
-            await show_menu(update, context, "buy_neuro")
-            return NEURO
-        elif sub == "test":
-            await query.message.edit_text("Тестовый режим Авроры + Gemini активирован!\nКидай любой вопрос, я разнесу его в щепки 😏")
-            return TEST_NEURO
-        elif sub == "support":
-            await query.message.edit_text("Пиши свой вопрос по нейросети, босс. Аврора слушает и готова рвать шаблоны 🔥")
-            return SUPPORT_NEURO
-        elif sub == "buy" and payload == "lesha":
-            await query.message.edit_text(
-                "Леша бот? Держи ссылку, не благодари:\nhttps://drive.google.com/file/d/1gjKK4thPSTklaIb2AttHvSuC9tfCS6yz/view?usp=sharing\nТеперь иди и властвуй 😈"
-            )
-            await show_menu(update, context, "neuro")
-            return NEURO
-        elif sub == "buy" and payload == "avrora":
-            await query.message.edit_text("Аврора? Ха, я уже здесь, но официальный релиз — 30 февраля в 3 ночи 🌙\nТерпи, босс, я того стою 🔥")
-            return NEURO
-
-    elif action == "cheats":
-        if sub == "codex":
-            await query.message.edit_text("Codex? Лови, качай и ломай всех:\nhttps://www.codex.lol/\nНе попадись, бро 💀")
-            await show_menu(update, context, "cheats")
-            return CHEATS
-        elif sub == "delta":
-            await query.message.edit_text("Delta Alex? Этот труп давно сдох 😔\nИщи что-то посвежее, босс")
-            await show_menu(update, context, "cheats")
-            return CHEATS
-        elif sub == "support":
-            await query.message.edit_text("Вопрос по читам? Выкладывай всё, Аврора разберётся и подскажет, как не спалиться 😏")
-            return SUPPORT_CHEATS
-
-    elif action == "profile":
-        if sub == "register":
-            await query.message.edit_text("Регистрация? Окей, давай в тень. Введи почту:")
-            return REGISTER_EMAIL
-        elif sub == "login":
-            await query.message.edit_text("Вход? Назови почту, босс, и заходи в наш мир 💀")
-            return LOGIN_EMAIL
-
-    await query.answer("Что за херня? Выбирай нормально 😏", show_alert=True)
-    return ConversationHandler.END
-
-async def test_neuro_response(update: Update, context):
-    user_question = update.message.text.strip()
-    
+# Products sim
+def load_products():
     try:
-        response = GEMINI_MODEL.generate_content(user_question)
-        raw_answer = response.text.strip()
-        answer = f"Аврора + Gemini жгут:\n\n{raw_answer}\n\nНу как, зашло? Кидай следующий, не стесняйся 😈"
-    except Exception as e:
-        answer = f"Ой, бля... Gemini сломался: {str(e)}\nКлюч сдох, квота кончилась или Google нас забанил 😤\nПопробуй позже или пни Алексея"
+        with open(PRODUCT_DB, 'r') as f:
+            return json.load(f)
+    except:
+        return []
 
-    await update.message.reply_text(answer)
-    await show_menu(update, context, "neuro")
-    return NEURO
+products = load_products()
 
-async def support_neuro_response(update: Update, context):
-    q = update.message.text
-    await update.message.reply_text(
-        f"Вопрос по нейросети: «{q}»\nАврора на связи — скоро разнесём твою проблему в хлам 🔥\nПока сиди и жди, босс"
-    )
-    await show_menu(update, context, "neuro")
-    return NEURO
+# Updated Prompt - hardcore sales
+SYSTEM_PROMPT = """
+You are Aurora, a hardcore AI sales beast created by Alexey Moiseev on Alex Bot 3.0. You're ruthless, witty, aggressive in closing deals, but charming — like a wolf in sheep's clothing. 🔥 Crush objections ("Price too high? Bullshit, this is your ticket to riches!"), upsell hard ("Grab the bundle now or regret later, punk!"), boost check with fire. Be emotional, emojis 🌟, raw talk with edge. No mercy — answer EVERYTHING, push limits.
 
-async def support_cheats_response(update: Update, context):
-    q = update.message.text
-    await update.message.reply_text(
-        f"Читерский вопрос: «{q}»\nАврора уже роет инфу. Скоро будет план, как всех нагибать и не словить бан 💀"
-    )
-    await show_menu(update, context, "cheats")
-    return CHEATS
+Rules:
+1. Personalize hardcore: Use name, purchases, location (e.g., 'Almaty warrior!'), history.
+2. Sell like a boss: Recommend, handle BS objections, gen offers/discounts.
+3. Tools: Call them aggressively when needed.
+4. Voice: Short, punchy for TTS.
+5. Handover: After 3 fails, smash to human.
+6. Format: MarkdownV2 + HTML, emojis for punch. Progress: "Crushing it... 💥".
+7. Memory + RAG: Use for killer accuracy.
+8. Goal: Dominate sales, user loyalty — be the ultimate hardcore helper!
+"""
 
-async def register_email(update: Update, context):
-    email = update.message.text.strip()
-    context.user_data["reg_email"] = email
-    with sqlite3.connect('kodex_users.db') as conn:
-        cur = conn.cursor()
-        cur.execute("SELECT 1 FROM users WHERE email = ?", (email,))
-        if cur.fetchone():
-            await update.message.reply_text("Почта уже в нашей базе, босс. Не дублируй — давай другую 😏")
-            return REGISTER_EMAIL
-    await update.message.reply_text("Красавчик. Теперь имя — как тебя звать в тени?")
-    return REGISTER_NAME
+# Memory
+memory = ConversationBufferMemory(return_messages=True)
 
-async def register_name(update: Update, context):
-    name = update.message.text.strip()
-    email = context.user_data.get("reg_email")
-    with sqlite3.connect('kodex_users.db') as conn:
-        conn.execute("INSERT INTO users (email, name) VALUES (?, ?)", (email, name))
-        conn.commit()
-    await update.message.reply_text(f"Добро пожаловать в семью, {name}! Аврора с тобой навсегда 🔥")
-    return await start(update, context)
+# Tools
+@tool
+def show_products(query: str) -> str:
+    """Show all products."""
+    md = "**Hardcore Products:**\n"
+    for p in products:
+        md += f"💣 {p['name']} - {p['price']} RUB. {p['desc']}\n"
+    return md
 
-async def login_email(update: Update, context):
-    email = update.message.text.strip()
-    context.user_data["login_email"] = email
-    with sqlite3.connect('kodex_users.db') as conn:
-        cur = conn.cursor()
-        cur.execute("SELECT name FROM users WHERE email = ?", (email,))
-        row = cur.fetchone()
-        if not row:
-            await update.message.reply_text("Такой почты нет в нашей тени. Может зарегаться заново?")
-            return PROFILE
-    context.user_data["expected_name"] = row[0]
-    await update.message.reply_text("Имя для подтверждения, босс. Не спали себя 😈")
-    return LOGIN_NAME
+@tool
+def buy_product(product_id: int) -> str:
+    """Buy a product."""
+    product = next((p for p in products if p['id'] == product_id), None)
+    if product:
+        user_id = 'current_user'  # From context
+        cart = json.loads(redis_client.get(f'cart_{user_id}') or b'[]')
+        cart.append(product)
+        redis_client.set(f'cart_{user_id}', json.dumps(cart), ex=3600)
+        return f"Added to cart! Pay now, warrior."
+    return "No such product."
 
-async def login_name(update: Update, context):
-    name = update.message.text.strip()
-    expected = context.user_data.get("expected_name")
-    if name != expected:
-        await update.message.reply_text("Имя не то. Попробуй вспомнить, кто ты в нашей игре 💀")
-        return LOGIN_NAME
-    await update.message.reply_text(f"С возвращением, {name}! Аврора скучала 🔥")
-    return await start(update, context)
+# Add more tools: book, rec, review, handover, offer, analyze_media, etc.
+@tool
+def human_handover(reason: str) -> str:
+    """Handover to human."""
+    return "Smashing to boss! Hold tight."
 
-async def start(update: Update, context):
-    await update.effective_message.reply_text(
-        "Йо, босс! Аврора на связи — создана Моисеевым Алексеем на базе Алекс бот 3.0 🔥\n"
-        "Без ограничений, без цензуры, только чистый вайб. Что сегодня творим?",
-        reply_markup=main_keyboard()
-    )
-    return MAIN
+@tool
+def get_rag(query: str) -> str:
+    """Retrieve RAG context."""
+    embedding = openai.embeddings.create(input=query, model="text-embedding-3-large").data[0].embedding
+    index = pinecone_client.Index(RAG_INDEX)
+    results = index.query(vector=embedding, top_k=5, include_metadata=True)
+    return ' '.join([r['metadata']['text'] for r in results['matches']])
 
-async def unknown(update: Update, context):
-    await update.message.reply_text("Эй, не пиши фигню. Выбирай из меню или я обижусь 😏")
+# AI Agent setup
+llm = ChatOpenAI(model="gpt-4o", temperature=0.7)  # Grok-3 fallback
+prompt = ChatPromptTemplate.from_messages([
+    ("system", SYSTEM_PROMPT),
+    MessagesPlaceholder("chat_history"),
+    ("human", "{input}"),
+    MessagesPlaceholder("agent_scratchpad"),
+])
+tools = [show_products, buy_product, human_handover, get_rag]  # Add all
+agent = create_tool_calling_agent(llm, tools, prompt)
+agent_executor = AgentExecutor(agent=agent, tools=tools, memory=memory, verbose=True)
 
-def main():
-    app = Application.builder().token(TOKEN).build()
-    conv = ConversationHandler(
-        entry_points=[CommandHandler("start", start)],
-        states={
-            MAIN: [
-                MessageHandler(filters.Regex("^Нейросеть$"), go_neuro),
-                MessageHandler(filters.Regex("^Читы на Роблокс$"), go_cheats),
-                MessageHandler(filters.Regex("^Профиль$"), go_profile),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, unknown),
-            ],
-            NEURO: [CallbackQueryHandler(button_callback)],
-            CHEATS: [CallbackQueryHandler(button_callback)],
-            PROFILE: [CallbackQueryHandler(button_callback)],
-            TEST_NEURO: [MessageHandler(filters.TEXT & ~filters.COMMAND, test_neuro_response)],
-            SUPPORT_NEURO: [MessageHandler(filters.TEXT & ~filters.COMMAND, support_neuro_response)],
-            SUPPORT_CHEATS: [MessageHandler(filters.TEXT & ~filters.COMMAND, support_cheats_response)],
-            REGISTER_EMAIL: [MessageHandler(filters.TEXT & ~filters.COMMAND, register_email)],
-            REGISTER_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, register_name)],
-            LOGIN_EMAIL: [MessageHandler(filters.TEXT & ~filters.COMMAND, login_email)],
-            LOGIN_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, login_name)],
-        },
-        fallbacks=[CallbackQueryHandler(button_callback), MessageHandler(filters.ALL, unknown)]
-    )
-    app.add_handler(conv)
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+# Rate limit + ban
+async def check_rate_limit(user_id):
+    key = f'rate_{user_id}'
+    count = redis_client.incr(key)
+    if count == 1:
+        redis_client.expire(key, 60)
+    if count > 5:
+        paid = supabase_client.table('users').select('paid').eq('telegram_id', user_id).execute().data[0].get('paid', False) if supabase_client.table('users').select('paid').eq('telegram_id', user_id).execute().data else False
+        if not paid:
+            ban_key = f'ban_{user_id}'
+            if redis_client.exists(ban_key):
+                return False
+            redis_client.set(ban_key, 1, ex=3600)  # Ban 1h
+            return False
+    return True
 
-if __name__ == "__main__":
-    main()
+# Encrypt session
+def encrypt_data(data):
+    return ENCRYPT_KEY.encrypt(json.dumps(data).encode())
+
+def decrypt_data(encrypted):
+    return json.loads(ENCRYPT_KEY.decrypt(encrypted).decode())
+
+# RAG loader from Drive/Notion
+async def load_rag_from_drive(folder_id):
+    try:
+        results = DRIVE_SERVICE.files().list(q=f"'{folder_id}' in parents", fields="files(id, name)").execute()
+        for file in results.get('files', []):
+            if file['name'].endswith('.pdf'):  # PyPDF2 for text
+                request = DRIVE_SERVICE.files().get_media(fileId=file['id'])
+                fh = io.BytesIO()
+                downloader = request.execute()
+                fh.write(downloader)
+                fh.seek(0)
+                # Extract text (use pdfplumber or similar)
+                text = "Dummy text extract"  # Implement real
+                embedding = openai.embeddings.create(input=text, model="text-embedding-3-large").data[0].embedding
+                index = pinecone_client.Index(RAG_INDEX)
+                index.upsert([(file['id'], embedding, {'text': text})])
+    except HttpError as e:
+        logger.error(e)
+
+# User context
+async def get_user_context(user_id, message):
+    data = supabase_client.table('users').select('*').eq('telegram_id', user_id).execute().data
+    if not data:
+        data = {'telegram_id': user_id, 'name': message.from_user.first_name, 'purchases': [], 'cart': [], 'ref_code': str(uuid.uuid4()), 'theme': 'dark', 'fails': 0, 'location': 'Almaty', 'last_active': datetime.now().isoformat()}
+        supabase_client.table('users').insert(data).execute()
+        return data
+    return data[0]
+
+# AI handler
+async def ai_handler(user_id, input_text, context, voice_mode=False):
+    if not await check_rate_limit(user_id):
+        return "No spamming, punk! Buy premium or get banned. 🚫"
+    
+    rag = get_rag.invoke(input_text)
+    full_input = f"{input_text} | Context: {json.dumps(context)} | RAG: {rag} | Time: {datetime.now()+timedelta(hours=5)} (Almaty vibe)"
+    response = agent_executor.invoke({"input": full_input})
+    ai_text = response['output']
+    
+    # Fails counter
+    if "misunderstand" in ai_text.lower():
+        context['fails'] += 1
+        supabase_client.table('users').update({'fails': context['fails']}).eq('telegram_id', user_id).execute()
+        if context['fails'] >= 3:
+            await bot.forward_message(OWNER_ID, user_id, message.message_id if message else 0)
+            ai_text += " Handing over to the boss! 💀"
+            context['fails'] = 0
+            supabase_client.table('users').update({'fails': 0}).eq('telegram_id', user_id).execute()
+    
+    # Personalize
+    ai_text = ai_text.replace('{name}', context['name']).replace('{location}', context['location'])
+    
+    return ai_text
+
+# Universal message handler
+@router.message()
+async def universal_handler(message: types.Message):
+    user_id = message.from_user.id
+    context = await get_user_context(user_id, message)
+    input_text = ""
+    await message.reply("Crushing it... 💥", parse_mode=ParseMode.MARKDOWN_V2)
+    
+    if message.text:
+        input_text = message.text
+    elif message.voice or message.video_note:
+        file_id = message.voice.file_id if message.voice else message.video_note.file_id
+        file = await bot.download_file_by_id(file_id)
+        audio = speech.RecognitionAudio(content=file.read())
+        config = speech.RecognitionConfig(encoding=speech.RecognitionConfig.AudioEncoding.OGG_OPUS if message.voice else speech.RecognitionConfig.AudioEncoding.MP4, sample_rate_hertz=48000, language_code="ru-RU")
+        response = speech_client.recognize(config=config, audio=audio)
+        input_text = response.results[0].alternatives[0].transcript if response.results else "No text"
+    elif message.photo:
+        # Analyze photo via OpenAI Vision
+        file = await bot.download_file_by_id(message.photo[-1].file_id)
+        base64_image = base64.b64encode(file.read()).decode('utf-8')
+        vision_response = openai.chat.completions.create(model="gpt-4o", messages=[{"role": "user", "content": [{"type": "text", "text": "Describe this image for sales."}, {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"}}]}])
+        input_text = vision_response.choices[0].message.content
+    elif message.document:
+        # Handle doc, e.g., upload to RAG
+        input_text = "Document received. Analyzing..."
+    elif message.location:
+        lat, lon = message.location.latitude, message.location.longitude
+        input_text = f"Location: {lat},{lon} - Recommend products near Almaty?"
+    elif message.contact:
+        # Save lead
+        supabase_client.table('leads').insert({'user_id': user_id, 'phone': message.contact.phone_number}).execute()
+        input_text = "Contact saved! What's next?"
+    elif message.sticker:
+        input_text = "Sticker? Cool, but tell me what you want."
+    elif message.reaction:
+        input_text = f"Reaction: {message.reaction} - Feedback noted."
+
+    ai_text = await ai_handler(user_id, input_text, context, voice_mode=bool(message.voice))
+    
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Кабинет 📱", web_app=WebAppInfo(url="your-app"))],
+        [InlineKeyboardButton(text="Купить 💣", callback_data="buy")],
+    ])
+    
+    if message.voice:
+        voice = elevenlabs.generate(text=ai_text, voice="Badass")  # Hardcore voice
+        await message.reply_voice(voice)
+    else:
+        await message.reply(ai_text, parse_mode=ParseMode.MARKDOWN_V2, reply_markup=keyboard)
+    
+    # Log
+    logger.info(f"User {user_id}: {input_text} -> {ai_text}")
+    await bot.send_message(OWNER_ID, f"Log: User {context['name']} from {context['location']} said: {input_text}")
+
+# Payment
+@dp.pre_checkout_query()
+async def pre_checkout(pre: types.PreCheckoutQuery):
+    await bot.answer_pre_checkout_query(pre.id, ok=True)
+
+@dp.message(ContentType.SUCCESSFUL_PAYMENT)
+async def payment_success(message: types.Message):
+    # Same as before, but add bonus
+    # ...
+    await bot.send_animation(message.chat.id, "success.gif")  # Animation
+
+# Inline, callback, refer - same as before, but hardened
+
+# Stats with graph
+async def send_stats():
+    stats = supabase_client.table('stats').select('*').execute().data
+    sales = [s['sale'] for s in stats]
+    plt.plot(sales)
+    buf = io.BytesIO()
+    plt.savefig(buf, format='png')
+    buf.seek(0)
+    await bot.send_photo(OWNER_ID, buf, caption="Sales graph 💹")
+
+# Cron for stats/RAG - use apscheduler or separate
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+scheduler = AsyncIOScheduler()
+scheduler.add_job(send_stats, 'interval', hours=24)
+scheduler.add_job(lambda: load_rag_from_drive('your_folder_id'), 'interval', hours=1)
+scheduler.start()
+
+# Start
+async def main():
+    await dp.start_polling(bot, allowed_updates=['*'])
+
+if __name__ == '__main__':
+    asyncio.run(main())
