@@ -32,7 +32,7 @@ import matplotlib.pyplot as plt
 import io
 import base64
 
-# Env vars
+# Env vars + безопасный OWNER_ID
 BOT_TOKEN = os.getenv('BOT_TOKEN')
 OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')
 SUPABASE_URL = os.getenv('SUPABASE_URL')
@@ -41,13 +41,33 @@ REDIS_HOST = os.getenv('REDIS_HOST', 'localhost')
 REDIS_PORT = int(os.getenv('REDIS_PORT', 6379))
 GOOGLE_CREDENTIALS = os.getenv('GOOGLE_CREDENTIALS')
 ELEVENLABS_API_KEY = os.getenv('ELEVENLABS_API_KEY')
-OWNER_ID = int(os.getenv('OWNER_ID'))
+
+# Безопасная обработка OWNER_ID
+OWNER_ID_STR = os.getenv('OWNER_ID')
+if OWNER_ID_STR is None or not OWNER_ID_STR.strip():
+    logging.warning("OWNER_ID не задан в переменных окружения! Логи и handover будут отключены.")
+    OWNER_ID = None
+else:
+    try:
+        OWNER_ID = int(OWNER_ID_STR.strip())
+    except ValueError:
+        logging.error(f"OWNER_ID некорректный: '{OWNER_ID_STR}'. Должен быть числом.")
+        OWNER_ID = None
+
 PRODUCT_DB = 'products.json'
 RAG_INDEX = 'rag-index'
 ENCRYPT_KEY = Fernet.generate_key() if not os.getenv('ENCRYPT_KEY') else Fernet(os.getenv('ENCRYPT_KEY'))
 
-DRIVE_CREDENTIALS = service_account.Credentials.from_service_account_file(GOOGLE_CREDENTIALS, scopes=['https://www.googleapis.com/auth/drive.readonly'])
-DRIVE_SERVICE = build('drive', 'v3', credentials=DRIVE_CREDENTIALS)
+if GOOGLE_CREDENTIALS:
+    with open('google_credentials.json', 'w') as f:
+        f.write(GOOGLE_CREDENTIALS)
+    os.environ['GOOGLE_APPLICATION_CREDENTIALS'] = 'google_credentials.json'
+
+DRIVE_CREDENTIALS = service_account.Credentials.from_service_account_file(
+    'google_credentials.json', scopes=['https://www.googleapis.com/auth/drive.readonly']
+) if GOOGLE_CREDENTIALS else None
+
+DRIVE_SERVICE = build('drive', 'v3', credentials=DRIVE_CREDENTIALS) if DRIVE_CREDENTIALS else None
 
 # Setup
 logging.basicConfig(level=logging.INFO, filename='bot.log')
@@ -61,10 +81,11 @@ redis_client = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, db=0)
 supabase_client = supabase.create_client(SUPABASE_URL, SUPABASE_KEY)
 pinecone_client = Pinecone(api_key=os.getenv('PINECONE_API_KEY'))
 
-os.environ['GOOGLE_APPLICATION_CREDENTIALS'] = GOOGLE_CREDENTIALS
+if ELEVENLABS_API_KEY:
+    elevenlabs.set_api_key(ELEVENLABS_API_KEY)
+
 speech_client = speech.SpeechClient()
 tts_client = texttospeech.TextToSpeechClient()
-elevenlabs.set_api_key(ELEVENLABS_API_KEY)
 
 # Products sim
 def load_products():
@@ -92,7 +113,6 @@ Rules:
 # Tools
 @tool
 def show_products(query: str) -> str:
-    """Show all products."""
     md = "**Hardcore Products:**\n"
     for p in products:
         md += f"💣 {p['name']} - {p['price']} RUB. {p['desc']}\n"
@@ -100,10 +120,9 @@ def show_products(query: str) -> str:
 
 @tool
 def buy_product(product_id: int) -> str:
-    """Buy a product."""
     product = next((p for p in products if p['id'] == product_id), None)
     if product:
-        user_id = 'current_user'  # ← здесь потом подставляй реальный user_id
+        user_id = 'current_user'  # потом подставь реальный
         cart = json.loads(redis_client.get(f'cart_{user_id}') or b'[]')
         cart.append(product)
         redis_client.set(f'cart_{user_id}', json.dumps(cart), ex=3600)
@@ -112,18 +131,16 @@ def buy_product(product_id: int) -> str:
 
 @tool
 def human_handover(reason: str) -> str:
-    """Handover to human."""
     return "Smashing to boss! Hold tight."
 
 @tool
 def get_rag(query: str) -> str:
-    """Retrieve RAG context."""
     embedding = openai.embeddings.create(input=query, model="text-embedding-3-large").data[0].embedding
     index = pinecone_client.Index(RAG_INDEX)
     results = index.query(vector=embedding, top_k=5, include_metadata=True)
     return ' '.join([r['metadata']['text'] for r in results['matches']])
 
-# LLM + Prompt + Agent
+# LLM + Agent
 llm = ChatOpenAI(model="gpt-4o", temperature=0.7)
 
 prompt = ChatPromptTemplate.from_messages([
@@ -143,7 +160,6 @@ agent_executor = AgentExecutor(
     handle_parsing_errors=True
 )
 
-# Память per-user
 store = {}
 
 def get_session_history(user_id: str):
@@ -158,7 +174,7 @@ agent_with_history = RunnableWithMessageHistory(
     history_messages_key="chat_history",
 )
 
-# Rate limit + ban
+# Rate limit
 async def check_rate_limit(user_id):
     key = f'rate_{user_id}'
     count = redis_client.incr(key)
@@ -182,8 +198,11 @@ def encrypt_data(data):
 def decrypt_data(encrypted):
     return json.loads(ENCRYPT_KEY.decrypt(encrypted).decode())
 
-# RAG from Drive (заглушка — добавь pdfplumber когда сможешь)
+# RAG loader
 async def load_rag_from_drive(folder_id):
+    if not DRIVE_SERVICE:
+        logger.warning("Google Drive не настроен")
+        return
     try:
         results = DRIVE_SERVICE.files().list(q=f"'{folder_id}' in parents", fields="files(id, name)").execute()
         for file in results.get('files', []):
@@ -192,8 +211,8 @@ async def load_rag_from_drive(folder_id):
                 embedding = openai.embeddings.create(input=text, model="text-embedding-3-large").data[0].embedding
                 index = pinecone_client.Index(RAG_INDEX)
                 index.upsert([(file['id'], embedding, {'text': text})])
-    except HttpError as e:
-        logger.error(e)
+    except Exception as e:
+        logger.error(f"RAG load error: {e}")
 
 # User context
 async def get_user_context(user_id, message):
@@ -228,16 +247,15 @@ async def ai_handler(user_id, input_text, context, voice_mode=False):
     )
     ai_text = response['output']
 
-    # Fails counter
     if "misunderstand" in ai_text.lower() or "не понял" in ai_text.lower():
         context['fails'] = context.get('fails', 0) + 1
         supabase_client.table('users').update({'fails': context['fails']}).eq('telegram_id', user_id).execute()
-        if context['fails'] >= 3:
+        if context['fails'] >= 3 and OWNER_ID:
             ai_text += "\nHanding over to the boss! 💀"
+            # await bot.forward_message(OWNER_ID, user_id, message.message_id)  # раскомменти когда message будет в scope
             context['fails'] = 0
             supabase_client.table('users').update({'fails': 0}).eq('telegram_id', user_id).execute()
 
-    # Personalize
     ai_text = ai_text.replace('{name}', context.get('name', 'Warrior')).replace('{location}', context.get('location', 'Almaty'))
 
     return ai_text
@@ -294,13 +312,18 @@ async def universal_handler(message: types.Message):
     ])
 
     if message.voice:
-        voice_bytes = elevenlabs.generate(text=ai_text, voice="Badass")
-        await message.reply_voice(voice=voice_bytes)
+        try:
+            voice_bytes = elevenlabs.generate(text=ai_text, voice="Badass")
+            await message.reply_voice(voice=voice_bytes)
+        except Exception as e:
+            logger.error(f"TTS error: {e}")
+            await message.reply(ai_text, parse_mode=ParseMode.MARKDOWN_V2, reply_markup=keyboard)
     else:
         await message.reply(ai_text, parse_mode=ParseMode.MARKDOWN_V2, reply_markup=keyboard)
 
     logger.info(f"User {user_id}: {input_text} -> {ai_text}")
-    await bot.send_message(OWNER_ID, f"Log: {context.get('name')} from {context.get('location')} said: {input_text}")
+    if OWNER_ID:
+        await bot.send_message(OWNER_ID, f"Log: {context.get('name')} from {context.get('location')} said: {input_text}")
 
 # Payment
 @dp.pre_checkout_query()
@@ -309,7 +332,7 @@ async def pre_checkout(pre: types.PreCheckoutQuery):
 
 @dp.message(F.content_type == types.ContentType.SUCCESSFUL_PAYMENT)
 async def payment_success(message: types.Message):
-    await bot.send_animation(message.chat.id, "https://example.com/success.gif")  # замени на реальный
+    await bot.send_animation(message.chat.id, "https://example.com/success.gif")  # замени
 
 # Stats
 async def send_stats():
@@ -321,7 +344,8 @@ async def send_stats():
     buf = io.BytesIO()
     plt.savefig(buf, format='png')
     buf.seek(0)
-    await bot.send_photo(OWNER_ID, photo=buf, caption="Sales graph 💹")
+    if OWNER_ID:
+        await bot.send_photo(OWNER_ID, photo=buf, caption="Sales graph 💹")
 
 # Scheduler
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
