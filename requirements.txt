@@ -1,1 +1,2 @@
 python-telegram-bot
+pip install python-telegram-bot google-generativeai
