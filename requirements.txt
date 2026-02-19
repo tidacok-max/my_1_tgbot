@@ -2,3 +2,15 @@ aiogram<3.99,>=3.10
 langchain>=0.3.0
 langchain-openai>=0.3.0
 langchain-core>=0.3.0
+openai>=2.0.0
+pinecone-client
+redis
+supabase
+google-cloud-speech
+google-cloud-texttospeech
+elevenlabs
+matplotlib
+cryptography
+google-api-python-client
+google-auth-oauthlib
+apscheduler
