@@ -1,18 +1,5 @@
-aiogram<3.99,>=3.10
+aiogram>=3.10,<3.99
 langchain==0.3.16
-langchain-community==0.3.16
-langchain-core==0.3.83
 langchain-openai==0.3.35
-langchain-text-splitters==0.3.11
+langchain-core==0.3.83
 openai>=2.0.0
-pinecone>=5.0.0                # ← вот здесь фикс
-redis
-supabase
-google-cloud-speech
-google-cloud-texttospeech
-elevenlabs
-matplotlib
-cryptography
-google-api-python-client
-google-auth-oauthlib
-apscheduler
