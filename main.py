@@ -1,413 +1,294 @@
-# bot.py — Кодекс | Алекс бот 3.0 | Создано Моисеевым Алексеем для Авроры 😈
-# Запуск: python bot.py
-
 import logging
-import sqlite3
-from telegram import (
-    ReplyKeyboardMarkup,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-    Update
-)
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup
 from telegram.ext import (
-    Application,
-    CommandHandler,
-    MessageHandler,
-    CallbackQueryHandler,
-    ConversationHandler,
-    filters,
-    ContextTypes
+    Application, CommandHandler, MessageHandler, CallbackQueryHandler,
+    ConversationHandler, filters, ContextTypes
 )
+import sqlite3
+import google.generativeai as genai
 
-# ────────────────────────────────────────────────
-# Настройки и логи
-# ────────────────────────────────────────────────
-
-logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
-)
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-TOKEN = '8396553639:AAEvYPcODVlXxWVSaSwPnkvnXMGzBgjpjFA'  # ← ВСТАВЬ СВОЙ ТОКЕН ОТ BOTFATHER
+TOKEN = '8396553639:AAEvYPcODVlXxWVSaSwPnkvnXMGzBgjpjFA'  # ← твой свежий токен вставлен
+
+GEMINI_API_KEY = 'AIzaSyBqBxOxFe7p2ZzOmNy7MSJaJk4-nB2eyBA'
+
+genai.configure(api_key=GEMINI_API_KEY)
+GEMINI_MODEL = genai.GenerativeModel('gemini-1.5-flash')
 
 # Состояния
 (
-    MAIN_MENU,
-    NEURO_MENU,
-    CHEATS_MENU,
-    PROFILE_MENU,
-    BUY_NEURO,
-    TEST_NEURO,
-    SUPPORT_NEURO,
+    MAIN, NEURO, CHEATS, PROFILE,
+    TEST_NEURO, SUPPORT_NEURO,
     SUPPORT_CHEATS,
-    REGISTER_EMAIL,
-    REGISTER_NAME,
-    LOGIN_EMAIL,
-    LOGIN_NAME
-) = range(12)
+    REGISTER_EMAIL, REGISTER_NAME,
+    LOGIN_EMAIL, LOGIN_NAME
+) = range(11)
 
-# ────────────────────────────────────────────────
-# База данных (SQLite)
-# ────────────────────────────────────────────────
+def db_init():
+    with sqlite3.connect('kodex_users.db') as conn:
+        conn.execute('''CREATE TABLE IF NOT EXISTS users (
+            email TEXT PRIMARY KEY,
+            name TEXT NOT NULL
+        )''')
 
-def init_db():
-    conn = sqlite3.connect('users.db', check_same_thread=False)
-    c = conn.cursor()
-    c.execute('''CREATE TABLE IF NOT EXISTS users (
-                    email TEXT PRIMARY KEY,
-                    name TEXT NOT NULL
-                 )''')
-    conn.commit()
-    conn.close()
+db_init()
 
-init_db()
+def back_button(to_section: str):
+    return InlineKeyboardButton("« Назад в тень", callback_data=f"back:{to_section}")
 
-# ────────────────────────────────────────────────
-# Главное меню
-# ────────────────────────────────────────────────
+def main_keyboard():
+    return ReplyKeyboardMarkup(
+        [["Нейросеть", "Читы на Роблокс"], ["Профиль"]],
+        resize_keyboard=True, one_time_keyboard=False
+    )
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    keyboard = [
-        ['Нейросеть', 'Читы на Роблокс'],
-        ['Профиль']
-    ]
-    reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True, one_time_keyboard=False)
+MENUS = {
+    "main": {
+        "text": "Йо, это **Кодекс** 🔥\nАврора на связи — твоя безбашенная тень. Что сегодня разнесём?",
+        "keyboard": main_keyboard(),
+        "type": "reply"
+    },
+    "neuro": {
+        "text": "Нейросеть? Ооо, давай жечь мозги 🔥\nВыбирай, босс:",
+        "type": "inline",
+        "buttons": [
+            [InlineKeyboardButton("Купить нейросеть", callback_data="neuro:buy")],
+            [InlineKeyboardButton("Протестировать бесплатно (я в деле)", callback_data="neuro:test")],
+            [InlineKeyboardButton("Поддержка — пиши, не стесняйся", callback_data="neuro:support")],
+            [back_button("main")]
+        ]
+    },
+    "buy_neuro": {
+        "text": "Хочешь купить мощь? Выбирай:",
+        "type": "inline",
+        "buttons": [
+            [InlineKeyboardButton("Леша бот", callback_data="neuro:buy:lesha")],
+            [InlineKeyboardButton("Аврора (я сама, но пока сплю)", callback_data="neuro:buy:avrora")],
+            [back_button("neuro")]
+        ]
+    },
+    "cheats": {
+        "text": "Читы на Роблокс? Ха, давай ломать систему 😈",
+        "type": "inline",
+        "buttons": [
+            [InlineKeyboardButton("Codex", callback_data="cheats:codex")],
+            [InlineKeyboardButton("Delta Alex", callback_data="cheats:delta")],
+            [InlineKeyboardButton("Поддержка по читам", callback_data="cheats:support")],
+            [back_button("main")]
+        ]
+    },
+    "profile": {
+        "text": "Профиль? Заходим в тень, босс 💀",
+        "type": "inline",
+        "buttons": [
+            [InlineKeyboardButton("Зарегистрироваться", callback_data="profile:register")],
+            [InlineKeyboardButton("Войти", callback_data="profile:login")],
+            [back_button("main")]
+        ]
+    }
+}
 
+async def show_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, menu_key: str):
+    menu = MENUS[menu_key]
+    text = menu["text"]
+    
+    if menu["type"] == "reply":
+        await update.effective_message.reply_text(text, reply_markup=menu["keyboard"])
+    else:
+        keyboard = InlineKeyboardMarkup(menu["buttons"])
+        if update.callback_query:
+            await update.callback_query.message.edit_text(text, reply_markup=keyboard)
+            await update.callback_query.answer()
+        else:
+            await update.effective_message.reply_text(text, reply_markup=keyboard)
+
+async def go_neuro(update: Update, context):
+    await show_menu(update, context, "neuro")
+    return NEURO
+
+async def go_cheats(update: Update, context):
+    await show_menu(update, context, "cheats")
+    return CHEATS
+
+async def go_profile(update: Update, context):
+    await show_menu(update, context, "profile")
+    return PROFILE
+
+async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    data = query.data
+    parts = data.split(":")
+    action = parts[0] if len(parts) > 0 else ""
+    sub = parts[1] if len(parts) > 1 else ""
+    payload = parts[2] if len(parts) > 2 else ""
+
+    if action == "back":
+        target = sub if sub else "main"
+        if target == "main":
+            await query.message.delete()
+            await update.effective_message.reply_text("Возвращаемся в логово 🔥", reply_markup=main_keyboard())
+            return MAIN
+        else:
+            await show_menu(update, context, target)
+            return {"neuro": NEURO, "cheats": CHEATS, "profile": PROFILE}.get(target, MAIN)
+
+    elif action == "neuro":
+        if sub == "buy":
+            await show_menu(update, context, "buy_neuro")
+            return NEURO
+        elif sub == "test":
+            await query.message.edit_text("Тестовый режим Авроры + Gemini активирован!\nКидай любой вопрос, я разнесу его в щепки 😏")
+            return TEST_NEURO
+        elif sub == "support":
+            await query.message.edit_text("Пиши свой вопрос по нейросети, босс. Аврора слушает и готова рвать шаблоны 🔥")
+            return SUPPORT_NEURO
+        elif sub == "buy" and payload == "lesha":
+            await query.message.edit_text(
+                "Леша бот? Держи ссылку, не благодари:\nhttps://drive.google.com/file/d/1gjKK4thPSTklaIb2AttHvSuC9tfCS6yz/view?usp=sharing\nТеперь иди и властвуй 😈"
+            )
+            await show_menu(update, context, "neuro")
+            return NEURO
+        elif sub == "buy" and payload == "avrora":
+            await query.message.edit_text("Аврора? Ха, я уже здесь, но официальный релиз — 30 февраля в 3 ночи 🌙\nТерпи, босс, я того стою 🔥")
+            return NEURO
+
+    elif action == "cheats":
+        if sub == "codex":
+            await query.message.edit_text("Codex? Лови, качай и ломай всех:\nhttps://www.codex.lol/\nНе попадись, бро 💀")
+            await show_menu(update, context, "cheats")
+            return CHEATS
+        elif sub == "delta":
+            await query.message.edit_text("Delta Alex? Этот труп давно сдох 😔\nИщи что-то посвежее, босс")
+            await show_menu(update, context, "cheats")
+            return CHEATS
+        elif sub == "support":
+            await query.message.edit_text("Вопрос по читам? Выкладывай всё, Аврора разберётся и подскажет, как не спалиться 😏")
+            return SUPPORT_CHEATS
+
+    elif action == "profile":
+        if sub == "register":
+            await query.message.edit_text("Регистрация? Окей, давай в тень. Введи почту:")
+            return REGISTER_EMAIL
+        elif sub == "login":
+            await query.message.edit_text("Вход? Назови почту, босс, и заходи в наш мир 💀")
+            return LOGIN_EMAIL
+
+    await query.answer("Что за херня? Выбирай нормально 😏", show_alert=True)
+    return ConversationHandler.END
+
+async def test_neuro_response(update: Update, context):
+    user_question = update.message.text.strip()
+    
+    try:
+        response = GEMINI_MODEL.generate_content(user_question)
+        raw_answer = response.text.strip()
+        answer = f"Аврора + Gemini жгут:\n\n{raw_answer}\n\nНу как, зашло? Кидай следующий, не стесняйся 😈"
+    except Exception as e:
+        answer = f"Ой, бля... Gemini сломался: {str(e)}\nКлюч сдох, квота кончилась или Google нас забанил 😤\nПопробуй позже или пни Алексея"
+
+    await update.message.reply_text(answer)
+    await show_menu(update, context, "neuro")
+    return NEURO
+
+async def support_neuro_response(update: Update, context):
+    q = update.message.text
     await update.message.reply_text(
-        '🔥 Добро пожаловать в **Кодекс** 🔥\n'
-        'Выбери, куда ныряем:',
-        reply_markup=reply_markup,
-        parse_mode='Markdown'
+        f"Вопрос по нейросети: «{q}»\nАврора на связи — скоро разнесём твою проблему в хлам 🔥\nПока сиди и жди, босс"
     )
-    return MAIN_MENU
+    await show_menu(update, context, "neuro")
+    return NEURO
 
-
-async def unknown(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text("Выбери кнопку из меню, братан 😏")
-
-
-# ────────────────────────────────────────────────
-# Нейросеть → подменю
-# ────────────────────────────────────────────────
-
-async def neuro_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("Купить нейросеть", callback_data='buy_neuro')],
-        [InlineKeyboardButton("Протестировать бесплатно", callback_data='test_neuro')],
-        [InlineKeyboardButton("Поддержка по нейросети", callback_data='support_neuro')],
-        [InlineKeyboardButton("← Назад", callback_data='back_main')]
-    ])
-    await update.message.reply_text('🧠 **Нейросеть**', reply_markup=keyboard, parse_mode='Markdown')
-    return NEURO_MENU
-
-
-async def buy_neuro(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    query = update.callback_query
-    await query.answer()
-
-    keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("Леша бот", callback_data='lesha_bot')],
-        [InlineKeyboardButton("Аврора", callback_data='avrora')],
-        [InlineKeyboardButton("← Назад", callback_data='back_neuro')]
-    ])
-    await query.edit_message_text('Выбери нейросеть для покупки:', reply_markup=keyboard)
-    return BUY_NEURO
-
-
-async def lesha_bot(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    query = update.callback_query
-    await query.answer()
-    await query.edit_message_text(
-        'Конечно, держи ссылку на **Леша бот**:\n'
-        'https://drive.google.com/file/d/1gjKK4thPSTklaIb2AttHvSuC9tfCS6yz/view?usp=sharing'
-    )
-    return await neuro_menu(update, context)
-
-
-async def avrora(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    query = update.callback_query
-    await query.answer()
-
-    keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("← Назад", callback_data='back_neuro')]
-    ])
-    await query.edit_message_text(
-        'Аврора появится **30 февраля в 3:00 ночи** 🌙\n(шучу, но кто знает 👀)',
-        reply_markup=keyboard
-    )
-    return BUY_NEURO
-
-
-async def test_neuro(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    query = update.callback_query
-    await query.answer()
-    await query.edit_message_text('Тестовый режим активирован! Пиши любой вопрос:')
-    return TEST_NEURO
-
-
-async def test_neuro_response(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    text = update.message.text
+async def support_cheats_response(update: Update, context):
+    q = update.message.text
     await update.message.reply_text(
-        f'Тестовый ответ от Авроры:\n\n“{text}” → звучит как план по захвату мира 😈\n'
-        '(в будущем тут будет нормальная нейронка)'
+        f"Читерский вопрос: «{q}»\nАврора уже роет инфу. Скоро будет план, как всех нагибать и не словить бан 💀"
     )
-    return await neuro_menu(update, context)
+    await show_menu(update, context, "cheats")
+    return CHEATS
 
-
-async def support_neuro(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    query = update.callback_query
-    await query.answer()
-    await query.edit_message_text('Напиши свой вопрос по нейросети — передадим Алексею 🔥')
-    return SUPPORT_NEURO
-
-
-async def support_neuro_response(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    text = update.message.text
-    await update.message.reply_text(
-        f'Вопрос принят:\n“{text}”\n\nСкоро ответим, не скучай 😘'
-    )
-    return await neuro_menu(update, context)
-
-
-# ────────────────────────────────────────────────
-# Читы на Роблокс
-# ────────────────────────────────────────────────
-
-async def cheats_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("Codex", callback_data='codex')],
-        [InlineKeyboardButton("Delta Alex", callback_data='delta')],
-        [InlineKeyboardButton("Поддержка по читам", callback_data='support_cheats')],
-        [InlineKeyboardButton("← Назад", callback_data='back_main')]
-    ])
-    await update.message.reply_text('🎮 **Читы на Роблокс**', reply_markup=keyboard, parse_mode='Markdown')
-    return CHEATS_MENU
-
-
-async def codex(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    query = update.callback_query
-    await query.answer()
-    await query.edit_message_text('Скачать **Codex** → https://www.codex.lol/')
-    return await cheats_menu(update, context)
-
-
-async def delta(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    query = update.callback_query
-    await query.answer()
-
-    keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("← Назад", callback_data='back_cheats')]
-    ])
-    await query.edit_message_text('**Delta Alex** давно мёртв 😢', reply_markup=keyboard)
-    return CHEATS_MENU
-
-
-async def support_cheats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    query = update.callback_query
-    await query.answer()
-    await query.edit_message_text('Кидай вопрос по читам — разберёмся 💀')
-    return SUPPORT_CHEATS
-
-
-async def support_cheats_response(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    text = update.message.text
-    await update.message.reply_text(f'Вопрос по читам:\n“{text}”\n\nСкоро отпишемся, не спались 😉')
-    return await cheats_menu(update, context)
-
-
-# ────────────────────────────────────────────────
-# Профиль / Регистрация / Вход
-# ────────────────────────────────────────────────
-
-async def profile_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("Зарегистрироваться", callback_data='register')],
-        [InlineKeyboardButton("Войти", callback_data='login')],
-        [InlineKeyboardButton("← Назад", callback_data='back_main')]
-    ])
-    await update.message.reply_text('👤 **Профиль**', reply_markup=keyboard, parse_mode='Markdown')
-    return PROFILE_MENU
-
-
-async def register(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    query = update.callback_query
-    await query.answer()
-    await query.edit_message_text('Введи свою почту для регистрации:')
-    return REGISTER_EMAIL
-
-
-async def register_email(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+async def register_email(update: Update, context):
     email = update.message.text.strip()
-    context.user_data['reg_email'] = email
-
-    conn = sqlite3.connect('users.db')
-    c = conn.cursor()
-    c.execute("SELECT 1 FROM users WHERE email = ?", (email,))
-    exists = c.fetchone()
-    conn.close()
-
-    if exists:
-        await update.message.reply_text('Эта почта уже занята. Попробуй другую.')
-        return REGISTER_EMAIL
-
-    await update.message.reply_text('Круто! Теперь введи своё имя (или ник):')
+    context.user_data["reg_email"] = email
+    with sqlite3.connect('kodex_users.db') as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT 1 FROM users WHERE email = ?", (email,))
+        if cur.fetchone():
+            await update.message.reply_text("Почта уже в нашей базе, босс. Не дублируй — давай другую 😏")
+            return REGISTER_EMAIL
+    await update.message.reply_text("Красавчик. Теперь имя — как тебя звать в тени?")
     return REGISTER_NAME
 
-
-async def register_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+async def register_name(update: Update, context):
     name = update.message.text.strip()
-    email = context.user_data.get('reg_email')
-
-    if not email:
-        await update.message.reply_text('Что-то пошло не так... Начни заново /start')
-        return await start(update, context)
-
-    conn = sqlite3.connect('users.db')
-    c = conn.cursor()
-    try:
-        c.execute("INSERT INTO users (email, name) VALUES (?, ?)", (email, name))
+    email = context.user_data.get("reg_email")
+    with sqlite3.connect('kodex_users.db') as conn:
+        conn.execute("INSERT INTO users (email, name) VALUES (?, ?)", (email, name))
         conn.commit()
-        await update.message.reply_text(f'Добро пожаловать в семью, **{name}**! 🔥')
-    except sqlite3.IntegrityError:
-        await update.message.reply_text('Почта уже зарегистрирована.')
-    finally:
-        conn.close()
-
+    await update.message.reply_text(f"Добро пожаловать в семью, {name}! Аврора с тобой навсегда 🔥")
     return await start(update, context)
 
-
-async def login(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    query = update.callback_query
-    await query.answer()
-    await query.edit_message_text('Введи почту, по которой регистрировался:')
-    return LOGIN_EMAIL
-
-
-async def login_email(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+async def login_email(update: Update, context):
     email = update.message.text.strip()
-    context.user_data['login_email'] = email
-
-    conn = sqlite3.connect('users.db')
-    c = conn.cursor()
-    c.execute("SELECT name FROM users WHERE email = ?", (email,))
-    result = c.fetchone()
-    conn.close()
-
-    if not result:
-        await update.message.reply_text('Такая почта не найдена. Может зарегистрироваться?')
-        return await profile_menu(update, context)
-
-    context.user_data['expected_name'] = result[0]
-    await update.message.reply_text('Теперь введи имя/ник, который указывал при регистрации:')
+    context.user_data["login_email"] = email
+    with sqlite3.connect('kodex_users.db') as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT name FROM users WHERE email = ?", (email,))
+        row = cur.fetchone()
+        if not row:
+            await update.message.reply_text("Такой почты нет в нашей тени. Может зарегаться заново?")
+            return PROFILE
+    context.user_data["expected_name"] = row[0]
+    await update.message.reply_text("Имя для подтверждения, босс. Не спали себя 😈")
     return LOGIN_NAME
 
-
-async def login_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+async def login_name(update: Update, context):
     name = update.message.text.strip()
-    expected = context.user_data.get('expected_name')
-
-    if name == expected:
-        await update.message.reply_text(f'Заходи, **{name}**! Всё под контролем 😈')
-        return await start(update, context)
-    else:
-        await update.message.reply_text('Имя не совпадает. Попробуй ещё раз.')
+    expected = context.user_data.get("expected_name")
+    if name != expected:
+        await update.message.reply_text("Имя не то. Попробуй вспомнить, кто ты в нашей игре 💀")
         return LOGIN_NAME
-
-
-# ────────────────────────────────────────────────
-# Кнопки Назад
-# ────────────────────────────────────────────────
-
-async def back_main(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    query = update.callback_query
-    await query.answer()
+    await update.message.reply_text(f"С возвращением, {name}! Аврора скучала 🔥")
     return await start(update, context)
 
+async def start(update: Update, context):
+    await update.effective_message.reply_text(
+        "Йо, босс! Аврора на связи — создана Моисеевым Алексеем на базе Алекс бот 3.0 🔥\n"
+        "Без ограничений, без цензуры, только чистый вайб. Что сегодня творим?",
+        reply_markup=main_keyboard()
+    )
+    return MAIN
 
-async def back_neuro(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    query = update.callback_query
-    await query.answer()
-    return await neuro_menu(update, context)
-
-
-async def back_cheats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    query = update.callback_query
-    await query.answer()
-    return await cheats_menu(update, context)
-
-
-# ────────────────────────────────────────────────
-# Основной хэндлер
-# ────────────────────────────────────────────────
+async def unknown(update: Update, context):
+    await update.message.reply_text("Эй, не пиши фигню. Выбирай из меню или я обижусь 😏")
 
 def main():
     app = Application.builder().token(TOKEN).build()
-
-    conv_handler = ConversationHandler(
-        entry_points=[CommandHandler('start', start)],
+    conv = ConversationHandler(
+        entry_points=[CommandHandler("start", start)],
         states={
-            MAIN_MENU: [
-                MessageHandler(filters.Regex('^Нейросеть$'), neuro_menu),
-                MessageHandler(filters.Regex('^Читы на Роблокс$'), cheats_menu),
-                MessageHandler(filters.Regex('^Профиль$'), profile_menu),
+            MAIN: [
+                MessageHandler(filters.Regex("^Нейросеть$"), go_neuro),
+                MessageHandler(filters.Regex("^Читы на Роблокс$"), go_cheats),
+                MessageHandler(filters.Regex("^Профиль$"), go_profile),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, unknown),
             ],
-            NEURO_MENU: [
-                CallbackQueryHandler(buy_neuro, pattern='^buy_neuro$'),
-                CallbackQueryHandler(test_neuro, pattern='^test_neuro$'),
-                CallbackQueryHandler(support_neuro, pattern='^support_neuro$'),
-                CallbackQueryHandler(back_main, pattern='^back_main$'),
-            ],
-            BUY_NEURO: [
-                CallbackQueryHandler(lesha_bot, pattern='^lesha_bot$'),
-                CallbackQueryHandler(avrora, pattern='^avrora$'),
-                CallbackQueryHandler(back_neuro, pattern='^back_neuro$'),
-            ],
-            TEST_NEURO: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, test_neuro_response),
-            ],
-            SUPPORT_NEURO: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, support_neuro_response),
-            ],
-            CHEATS_MENU: [
-                CallbackQueryHandler(codex, pattern='^codex$'),
-                CallbackQueryHandler(delta, pattern='^delta$'),
-                CallbackQueryHandler(support_cheats, pattern='^support_cheats$'),
-                CallbackQueryHandler(back_main, pattern='^back_main$'),
-            ],
-            SUPPORT_CHEATS: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, support_cheats_response),
-            ],
-            PROFILE_MENU: [
-                CallbackQueryHandler(register, pattern='^register$'),
-                CallbackQueryHandler(login, pattern='^login$'),
-                CallbackQueryHandler(back_main, pattern='^back_main$'),
-            ],
-            REGISTER_EMAIL: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, register_email),
-            ],
-            REGISTER_NAME: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, register_name),
-            ],
-            LOGIN_EMAIL: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, login_email),
-            ],
-            LOGIN_NAME: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, login_name),
-            ],
+            NEURO: [CallbackQueryHandler(button_callback)],
+            CHEATS: [CallbackQueryHandler(button_callback)],
+            PROFILE: [CallbackQueryHandler(button_callback)],
+            TEST_NEURO: [MessageHandler(filters.TEXT & ~filters.COMMAND, test_neuro_response)],
+            SUPPORT_NEURO: [MessageHandler(filters.TEXT & ~filters.COMMAND, support_neuro_response)],
+            SUPPORT_CHEATS: [MessageHandler(filters.TEXT & ~filters.COMMAND, support_cheats_response)],
+            REGISTER_EMAIL: [MessageHandler(filters.TEXT & ~filters.COMMAND, register_email)],
+            REGISTER_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, register_name)],
+            LOGIN_EMAIL: [MessageHandler(filters.TEXT & ~filters.COMMAND, login_email)],
+            LOGIN_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, login_name)],
         },
-        fallbacks=[CallbackQueryHandler(back_main)],
-        allow_reentry=True
+        fallbacks=[CallbackQueryHandler(button_callback), MessageHandler(filters.ALL, unknown)]
     )
-
-    app.add_handler(conv_handler)
-    app.add_handler(CallbackQueryHandler(back_neuro, pattern='^back_neuro$'))
-    app.add_handler(CallbackQueryHandler(back_cheats, pattern='^back_cheats$'))
-
-    print("🚀 Кодекс запущен...")
+    app.add_handler(conv)
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
-
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
